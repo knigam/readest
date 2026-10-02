@@ -24,6 +24,12 @@ const audioWithoutChapters = (duration: number) => ({
   quality: { warnings: [] },
 });
 
+type SourceChapter = { title: string; start: number; timeScale?: number; end?: number };
+const audioWithChapters = (duration: number, chapters: SourceChapter[]) => ({
+  ...audioWithoutChapters(duration),
+  format: { duration, chapters, trackInfo: [], tagTypes: [] },
+});
+
 describe('buildAudiobookChapters', () => {
   it('converts MP4 chapter timescales and derives missing end times', () => {
     expect(
@@ -166,6 +172,80 @@ describe('parseAudiobookFile', () => {
     ).resolves.toMatchObject({
       chapters: [{ label: 'The Book', start: 0, end: 90 }],
     });
+  });
+
+  it('prefers the MP4 reader when music-metadata undercounts the chapters', async () => {
+    // music-metadata reports one chapter per chunk, so a chapter track that
+    // packs its samples into a single chunk comes back as one chapter.
+    vi.mocked(parseBlob).mockResolvedValue(
+      audioWithChapters(90, [{ title: '001', start: 0, timeScale: 1_000 }]),
+    );
+    vi.mocked(readMp4Chapters).mockResolvedValue([
+      { title: '001', start: 0, timeScale: 1_000 },
+      { title: '002', start: 30_000, timeScale: 1_000 },
+      { title: '003', start: 60_000, timeScale: 1_000 },
+    ]);
+
+    await expect(
+      parseAudiobookFile(new File(['audio'], 'book.m4b'), 'audio-0'),
+    ).resolves.toMatchObject({
+      chapters: [
+        { label: '001', start: 0, end: 30 },
+        { label: '002', start: 30, end: 60 },
+        { label: '003', start: 60, end: 90 },
+      ],
+    });
+  });
+
+  it('keeps the parser chapters when they are richer than the MP4 reader', async () => {
+    vi.mocked(parseBlob).mockResolvedValue(
+      audioWithChapters(30, [
+        { title: 'First', start: 2, end: 12 },
+        { title: 'Second', start: 12, end: 30 },
+      ]),
+    );
+    vi.mocked(readMp4Chapters).mockResolvedValue([]);
+
+    await expect(
+      parseAudiobookFile(new File(['audio'], 'track.mp3'), 'audio-0'),
+    ).resolves.toMatchObject({
+      chapters: [
+        { label: 'First', start: 2, end: 12 },
+        { label: 'Second', start: 12, end: 30 },
+      ],
+    });
+  });
+
+  it('retries without chapter parsing when music-metadata throws on the chapter track', async () => {
+    vi.mocked(parseBlob)
+      .mockRejectedValueOnce(
+        new Error('Expected equal chunk-offset-table & sample-size-table length.'),
+      )
+      .mockResolvedValueOnce(audioWithoutChapters(90));
+    vi.mocked(readMp4Chapters).mockResolvedValue([
+      { title: 'Chapter 1', start: 0, timeScale: 1_000 },
+      { title: 'Chapter 2', start: 45_000, timeScale: 1_000 },
+    ]);
+
+    await expect(
+      parseAudiobookFile(new File(['audio'], 'book.m4b'), 'audio-0'),
+    ).resolves.toMatchObject({
+      duration: 90,
+      chapters: [
+        { label: 'Chapter 1', start: 0, end: 45 },
+        { label: 'Chapter 2', start: 45, end: 90 },
+      ],
+    });
+    expect(parseBlob).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(parseBlob).mock.calls[1]![1]).toMatchObject({ includeChapters: false });
+  });
+
+  it('rejects when the audio cannot be parsed even without chapters', async () => {
+    vi.mocked(parseBlob).mockRejectedValue(new Error('Guessed MIME-type not supported'));
+
+    await expect(parseAudiobookFile(new File(['audio'], 'broken.m4b'), 'audio-0')).rejects.toThrow(
+      'Guessed MIME-type not supported',
+    );
   });
 
   it('rejects audio whose duration cannot be determined', async () => {

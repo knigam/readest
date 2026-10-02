@@ -69,25 +69,28 @@ export const parseAudiobookFile = async (
   // Keep the parser's sizeable codec graph out of the reader's initial chunk;
   // it is only needed after the user opens the pairing wizard and picks audio.
   const { parseBlob } = await import('music-metadata');
-  const metadata = await parseBlob(file, {
-    duration: true,
-    includeChapters: true,
-    skipCovers: true,
+  const options = { duration: true, skipCovers: true };
+  const metadata = await parseBlob(file, { ...options, includeChapters: true }).catch((error) => {
+    // Chapter parsing throws on a track whose samples share a chunk. The rest
+    // of the tags are still readable, and chapters are read below regardless.
+    console.warn(`Retrying ${file.name} without chapter parsing:`, error);
+    return parseBlob(file, { ...options, includeChapters: false });
   });
   const duration = metadata.format.duration ?? 0;
   if (!Number.isFinite(duration) || duration <= 0) {
     throw new Error(`Could not determine the duration of ${file.name}`);
   }
 
-  let sourceChapters: ChapterSource[] = metadata.format.chapters ?? [];
-  if (!sourceChapters.length) {
-    // music-metadata misses MP4 chapters when moov follows the audio, and
-    // never reads Nero chapters; see mp4Chapters.ts.
-    sourceChapters = await readMp4Chapters(file).catch((error) => {
-      console.warn(`Failed to read MP4 chapters from ${file.name}:`, error);
-      return [];
-    });
-  }
+  // music-metadata misses MP4 chapters when moov follows the audio, counts one
+  // chapter per chunk rather than per sample, and never reads Nero chapters;
+  // see mp4Chapters.ts. Whichever source describes more chapters wins.
+  const parsedChapters: ChapterSource[] = metadata.format.chapters ?? [];
+  const fileChapters = await readMp4Chapters(file).catch((error) => {
+    console.warn(`Failed to read MP4 chapters from ${file.name}:`, error);
+    return [];
+  });
+  const sourceChapters =
+    fileChapters.length > parsedChapters.length ? fileChapters : parsedChapters;
   // The embedded title names the single chapter only when no chapter list
   // survived, so a file whose chapters are all rejected keeps its title.
   const chapters = buildAudiobookChapters(
